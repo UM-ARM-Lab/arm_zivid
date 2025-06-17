@@ -18,6 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import zivid
 import h5py
+import zarr
 import rclpy
 from rclpy.node import Node
 import psutil
@@ -49,6 +50,12 @@ def store_h5_dict(path, data_dict, compression="lzf", **ds_kwargs):
                 grp = hf.create_group(k)
                 for i, element in enumerate(data_dict[k]):  # ← now store as list, not np.stack
                     grp.create_dataset(f"{i:05d}", data=element, compression="lzf")
+
+# Saving as Zarr utility copied from robot_tool_2025s
+def store_zarr_dict(path, data_dict, **ds_kwargs):
+    with zarr.ZipStore(path=path, mode="w") as zf:
+        for k, v in data_dict.items():
+            zarr.array(data=v, path=k, store=zf)
 
 def get_local_hostname():
     import socket
@@ -443,12 +450,7 @@ class ZividPostProcessor:
                     self.pc_queue.put((self.next_expected_frame, pc))
                     self.timestamps_queue.put((self.next_expected_frame, timestamp))
                     
-                    # Add to in-memory history
-                    with self.history_lock:
-                        self.frame_history.append((self.next_expected_frame, rgb, depth, pc, timestamp))
-                        # Keep history size manageable (last 100 frames)
-                        if len(self.frame_history) > 100:
-                            self.frame_history.pop(0)
+                    # Add to in-memory historystore_
                     
                     self.next_expected_frame += 1
             sleep(0.001)  # Short sleep to avoid busy waiting
@@ -522,7 +524,8 @@ class ZividPostProcessor:
         # Save file
         save_path = self.dataset_tmpl.format(self.chunk_idx)
         if not self.dry_run:
-            store_h5_dict(save_path, save_dict)
+            # store_h5_dict(save_path, save_dict)
+            store_zarr_dict(save_path, save_dict)
         print(f"Saved {len(rgb_arr)} images to {save_path}")
         self.chunk_idx += 1
         
