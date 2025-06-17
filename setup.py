@@ -25,13 +25,13 @@ setup(
         'Programming Language :: Python',
         'Topic :: Software Development',
     ],
-    description='teleop control',
+    description='arm_zivid',
     license='MIT',
     # Like the CMakeLists add_executable macro, you can add your python
     # scripts here.
     entry_points={
         'console_scripts': [
-            'teleop_control.py = hdt_adroit_python.teleop_control:main'
+            'arm_zivid_ros_node.py = arm_zivid.arm_zivid_ros_node:main'
         ],
     },
 )

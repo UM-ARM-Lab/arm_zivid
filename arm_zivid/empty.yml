@@ -1,0 +1,75 @@
+__version__: 27
+Settings:
+  Acquisitions:
+    - Acquisition:
+        Aperture: __not_set__
+        Brightness: __not_set__
+        ExposureTime: __not_set__
+        Gain: __not_set__
+  Color: __not_set__
+  Diagnostics:
+    Enabled: __not_set__
+  Engine: __not_set__
+  Processing:
+    Color:
+      Balance:
+        Blue: __not_set__
+        Green: __not_set__
+        Red: __not_set__
+      Experimental:
+        Mode: __not_set__
+      Gamma: __not_set__
+    Filters:
+      Cluster:
+        Removal:
+          Enabled: __not_set__
+          MaxNeighborDistance: __not_set__
+          MinArea: __not_set__
+      Experimental:
+        ContrastDistortion:
+          Correction:
+            Enabled: __not_set__
+            Strength: __not_set__
+          Removal:
+            Enabled: __not_set__
+            Threshold: __not_set__
+      Hole:
+        Repair:
+          Enabled: __not_set__
+          HoleSize: __not_set__
+          Strictness: __not_set__
+      Noise:
+        Removal:
+          Enabled: __not_set__
+          Threshold: __not_set__
+        Repair:
+          Enabled: __not_set__
+        Suppression:
+          Enabled: __not_set__
+      Outlier:
+        Removal:
+          Enabled: __not_set__
+          Threshold: __not_set__
+      Reflection:
+        Removal:
+          Enabled: __not_set__
+          Mode: __not_set__
+      Smoothing:
+        Gaussian:
+          Enabled: __not_set__
+          Sigma: __not_set__
+    Resampling:
+      Mode: __not_set__
+  RegionOfInterest:
+    Box:
+      Enabled: __not_set__
+      Extents: __not_set__
+      PointA: __not_set__
+      PointB: __not_set__
+      PointO: __not_set__
+    Depth:
+      Enabled: __not_set__
+      Range: __not_set__
+  Sampling:
+    Color: __not_set__
+    Pixel: __not_set__
