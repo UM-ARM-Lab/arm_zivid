@@ -20,7 +20,6 @@ MASK_THRESHOLD = 0.25
 
 
 class ZividNode(Node):
-
     def __init__(self, camera, settings_yml: Optional[Path] = None):
         super().__init__('zivid_node')
         if settings_yml is not None:

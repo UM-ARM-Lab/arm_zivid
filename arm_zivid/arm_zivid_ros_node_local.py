@@ -24,10 +24,6 @@ import psutil
 
 from std_msgs.msg import Header
 
-
-# from sensor_msgs.msg import Image, PointCloud2
-
-
 CAMERA_FRAME = 'zivid_optical_frame'
 MASK_THRESHOLD = 0.25
 
@@ -150,26 +146,13 @@ class ZividLocalNode(Node):
         nframes = 0
         print(f"🚀 Starting capture loop - Online processing: {self.online_processing}")
         while rclpy.ok() and not self.shutdown_event.is_set():
-            capture_start = perf_counter()
             frame = self.camera.capture(self.settings)
-            capture_time = perf_counter() - capture_start
             timestamp = self.get_clock().now().to_msg()
-            
-            # if self.verbose:
-                # print(f"📸 Captured frame {self.frame_idx} in {capture_time*1000:.1f}ms")
-            
+
             if self.online_processing:
-                # Send frame directly to post processor for online processing
-                queue_size_before = self.post_processor.frame_queue.qsize()
                 self.post_processor.add_frame_online(self.frame_idx, frame, timestamp)
-                # if self.verbose:
-                #     print(f"  → Added to online processor (queue size: {queue_size_before} → {self.post_processor.frame_queue.qsize()})")
             else:
-                # Queue frame for raw saving only (offline mode)
-                queue_size_before = self.frame_queue.qsize()
                 self.frame_queue.put((self.frame_idx, frame))
-                # if self.verbose:
-                #     print(f"  → Added to raw frame queue (queue size: {queue_size_before} → {self.frame_queue.qsize()})")
 
             # Publish frame_id (sequence id = frame count)
             if not rclpy.ok():
@@ -369,11 +352,7 @@ class ZividPostProcessor:
         """Unified worker that processes frames from either objects (online) or files (offline)"""
         process_start = perf_counter()
         is_online = self.online_mode and timestamp is not None
-        
-        # if self.verbose:
-        #     mode_str = "online" if is_online else "offline"
-        #     print(f"🔄 Processing frame {frame_id} ({mode_str} mode)")
-        
+
         # Get frame object
         if isinstance(frame_source, str):
             # Offline mode: load from file
@@ -387,15 +366,11 @@ class ZividPostProcessor:
         # Process frame (same for both modes)
         point_cloud = frame_obj.point_cloud()
         xyz_mm = point_cloud.copy_data("xyz")
-        rgba = point_cloud.copy_data("rgba")
+        img = frame_obj.frame_2d().image_srgb()
 
         xyz = xyz_mm / 1000.0
-        rgb = rgba[:, :, :3]
+        rgb = img.copy_data()[:, :, :3]
         depth = xyz[:, :, 2]
-
-        # if self.verbose:
-        #     print(f"  📐 Frame {frame_id} dimensions: RGB={rgb.shape}, Depth={depth.shape}")
-        #     print(f"  📊 Frame {frame_id} data ranges: RGB=[{rgb.min():.3f}, {rgb.max():.3f}], Depth=[{np.nanmin(depth):.3f}, {np.nanmax(depth):.3f}]m")
 
         xyz_flat = xyz.reshape(-1, 3)
         is_valid = ~np.isnan(xyz_flat).any(axis=1)
@@ -406,12 +381,6 @@ class ZividPostProcessor:
         rgb_flat = rgb_flat[valid_idxs]  # remove NaNs
         pc = np.concatenate([xyz_flat_filtered, rgb_flat], axis=1).T
 
-        # if self.verbose:
-        #     total_points = xyz_flat.shape[0]
-        #     valid_points = xyz_flat_filtered.shape[0]
-        #     print(f"  🔍 Frame {frame_id} point cloud: {valid_points}/{total_points} valid points ({100*valid_points/total_points:.1f}%)")
-        #     print(f"  📏 Frame {frame_id} PC shape: {pc.shape}")
-
         # Handle output based on mode
         if is_online:
             # Online mode: use ordered processing with timestamps
@@ -421,10 +390,6 @@ class ZividPostProcessor:
             # Offline mode: use ordered processing but with None timestamp for consistency
             with self.results_lock:
                 self.processed_results[frame_id] = (rgb, depth, pc, None)
-
-        # if self.verbose:
-        #     process_time = perf_counter() - process_start
-        #     print(f"  ✅ Frame {frame_id} processed in {process_time*1000:.1f}ms")
 
         # Clean up frame object
         if should_cleanup:
@@ -588,18 +553,9 @@ def extract_config_name(settings_path):
     return Path(settings_path).stem
 
 def main():
-    # DEFAULT_SETTINGS_YML = "/home/zixuanh/ros2_ws/configs/Zivid2_Settings_Zivid_Two_M70_ParcelsReflective.yml"
-    # DEFAULT_SETTINGS_YML = "/home/zixuanh/ros2_ws/configs/Zivid2_Settings_Zivid_Two_M70_ParcelsReflective_50Hz.yml"
-    # DEFAULT_SETTINGS_YML = "/home/zixuanh/ros2_ws/configs/zivid2_Settings_Zivid_Two_M70_ParcelsMatte_10Hz_210.yml"
-    # DEFAULT_SETTINGS_YML = "/home/zixuanh/ros2_ws/configs/zivid2_Settings_Zivid_Two_M70_ParcelsMatte_10Hz_4xsparse_enginetop_boxed.yml"
-
     parser = argparse.ArgumentParser()
     parser.add_argument("--task", type=str, choices=["collect", "process"], default="collect")
-    parser.add_argument("-s", "--settings_yml", type=Path, nargs='+', default=[
-            "/home/zixuanh/ros2_ws/configs/zivid2_Settings_Zivid_Two_M70_ParcelsMatte_10Hz_4xsparse_enginetop_boxed.yml",
-            # "/home/zixuanh/ros2_ws/configs/zivid2_Settings_Zivid_Two_M70_ParcelsMatte_100Hz_enginetop_2D.yml"
-            # "/home/zixuanh/ros2_ws/configs/zivid2_Settings_Zivid_Two_M70_ParcelsMatte_10Hz_210.yml", 
-        ], 
+    parser.add_argument("-s", "--settings_yml", type=Path, nargs='+', required=True,
         help="One or more settings YAML files")
     parser.add_argument("-r", "--dataset_root", type=Path, default=os.path.expanduser("~/datasets/zivid"))
     parser.add_argument("-n", "--dataset_name", type=str, default="test")
