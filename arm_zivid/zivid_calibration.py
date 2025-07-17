@@ -84,9 +84,9 @@ def _main():
                 xyz_mm = point_cloud.copy_data("xyz")
                 rgb = point_cloud.copy_data("rgba")[..., :3]
                 t1 = time.time()
-                # rgb_msg = ros2_numpy.msgify(Image, rgb, encoding='rgb8')
-                # print(f"Converting to ROS image took {time.time()-t1}")
-                # rgb_pub.publish(rgb_msg)
+                rgb_msg = ros2_numpy.msgify(Image, rgb, encoding='rgb8')
+                print(f"Converting to ROS image took {time.time()-t1}")
+                rgb_pub.publish(rgb_msg)
                 print(f"Publishing RGB image took {time.time() - t1}")
                 xyz = xyz_mm / 1000.0
                 xyz_flat = xyz.reshape(-1, 3)

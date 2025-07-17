@@ -5,6 +5,7 @@
   <description>The arm_zivid package</description>
 
   <maintainer email="pmitrano@umich.edu">pmitrano</maintainer>
+  <maintainer email="houhd@umich.edu">houhd</maintainer>
 
   <license>MIT</license>
 
@@ -12,6 +13,9 @@
   <depend>ros2_numpy</depend>
   <depend>sensor_msgs</depend>
   <depend>std_msgs</depend>
+  <depend>opencv_python</depend>
+  <depend>h5py</depend>
+  <depend>zarr</depend>
 
   <exec_depend>message_runtime</exec_depend>
   <export>

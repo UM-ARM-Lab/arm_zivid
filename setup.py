@@ -12,7 +12,12 @@ setup(
         (os.path.join('share', package_name), ['package.xml']),
     ],
     # This is important as well
-    install_requires=['setuptools'],
+    install_requires=[
+        'setuptools',
+        'opencv-python',
+        'h5py',
+        'zarr<3.0.0',  # Ensure compatibility with zarr v2
+    ],
     zip_safe=True,
     author='ROS 2 Developer',
     author_email='ros2@ros.com',
@@ -31,7 +36,9 @@ setup(
     # scripts here.
     entry_points={
         'console_scripts': [
-            'arm_zivid_ros_node.py = arm_zivid.arm_zivid_ros_node:main'
+            'arm_zivid_ros_node.py = arm_zivid.arm_zivid_ros_node:main',
+            'arm_zivid_ros_node_local.py = arm_zivid.arm_zivid_ros_node_local:main',
+            'zivid_ds_to_vid.py = arm_zivid.zivid_ds_to_vid:main',
         ],
     },
 )

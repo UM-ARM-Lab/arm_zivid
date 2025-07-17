@@ -12,7 +12,6 @@ from rclpy.node import Node
 from sensor_msgs.msg import Image, PointCloud2
 
 from time import perf_counter
-import time
 import datetime
 
 CAMERA_FRAME = 'zivid_optical_frame'

@@ -17,34 +17,16 @@ from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import zivid
-import h5py
+
 import rclpy
 from rclpy.node import Node
 import psutil
 
 from std_msgs.msg import Header
+from arm_zivid.utils import get_local_hostname, store_data_dict, get_file_extension
 
 CAMERA_FRAME = 'zivid_optical_frame'
 MASK_THRESHOLD = 0.25
-
-# Saving as H5 utility copied from zxhuang97/force_tool
-def store_h5_dict(path, data_dict, compression="lzf", **ds_kwargs):
-    def is_field_homogeneous(arr):
-        if not isinstance(arr[0], np.ndarray):
-            return True
-        base_s = arr[0].shape
-        same_shape = np.array([base_s == arr[i].shape for i in range(len(arr))])
-        return same_shape.all()
-
-    with h5py.File(path, 'w') as hf:
-        for k, v in data_dict.items():
-            if is_field_homogeneous(v):
-                hf.create_dataset(k, data=v, compression=compression, **ds_kwargs)
-            else:
-                # Deal with PC
-                grp = hf.create_group(k)
-                for i, element in enumerate(data_dict[k]):  # ← now store as list, not np.stack
-                    grp.create_dataset(f"{i:05d}", data=element, compression="lzf")
 
 def get_local_hostname():
     import socket
@@ -67,6 +49,7 @@ class ZividLocalNode(Node):
             dry_run=False,
             process=True,  # If raw is not set, process online
             verbose=False,            # New: Enable verbose output
+            output_format="h5",       # New: Output format (h5 or zarr)
         ):
         # Create unique node name with config identifier
         node_name = f'zivid_node_local_{config_name}' if config_name else 'zivid_node_local'
@@ -87,6 +70,7 @@ class ZividLocalNode(Node):
         self.config_name = config_name
         self.online_processing = process
         self.verbose = verbose
+        self.output_format = output_format
         
         # Make metadata publisher with config-specific topic
         topic_name = f"/zivid_node_local/frame_id" if config_name else "/zivid_node_local/frame_id"
@@ -107,7 +91,8 @@ class ZividLocalNode(Node):
                 chunk_size=chunk_size,
                 dry_run=dry_run,
                 online_mode=True,
-                verbose=verbose
+                verbose=verbose,
+                output_format=output_format
             )
         else:
             self.frame_queue = Queue()
@@ -128,8 +113,13 @@ class ZividLocalNode(Node):
             path = os.path.abspath(os.path.join(dataset_root, dataset_name))
         os.makedirs(path, exist_ok=True)
         self.dataset_path = path
-
-        # Make raw frame level names
+        
+        # Use appropriate file extension based on output format
+        file_ext = get_file_extension(self.output_format)
+        dataset_tmpl = os.path.join(path, "processed_chunk")
+        self.dataset_tmpl = dataset_tmpl + "_{0}" + file_ext
+        
+        # Raw frame template for online mode
         frame_tmpl = os.path.join(path, "frame")
         self.frame_tmpl = frame_tmpl + "_{0}.zdf"
 
@@ -252,9 +242,11 @@ class ZividPostProcessor:
             dry_run=False,
             online_mode=False,  # New: Enable online processing mode
             verbose=False,      # New: Enable verbose output
+            output_format="h5", # New: Output format (h5 or zarr)
         ):
         # Make dataset collection
         self.config_name = config_name
+        self.output_format = output_format
         self._make_ds_tmpl(dataset_root, dataset_name, config_name)
         
         self.chunk_idx = 0
@@ -298,8 +290,11 @@ class ZividPostProcessor:
             path = os.path.abspath(os.path.join(dataset_root, dataset_name))
         os.makedirs(path, exist_ok=True)
         self.dataset_path = path
+        
+        # Use appropriate file extension based on output format
+        file_ext = get_file_extension(self.output_format)
         dataset_tmpl = os.path.join(path, "processed_chunk")
-        self.dataset_tmpl = dataset_tmpl+"_{0}.h5"
+        self.dataset_tmpl = dataset_tmpl + "_{0}" + file_ext
         
         # Raw frame template for online mode
         frame_tmpl = os.path.join(path, "frame")
@@ -337,6 +332,7 @@ class ZividPostProcessor:
         while not self.shutdown_event.is_set():
             if not self.frame_queue.empty():
                 frame_data = self.frame_queue.get()
+                print(f"After get, {self.frame_queue.qsize()} frames in queue")
                 if self.online_mode:
                     # Online mode: (frame_id, frame_obj, timestamp)
                     frame_id, frame_obj, timestamp = frame_data
@@ -350,7 +346,6 @@ class ZividPostProcessor:
 
     def post_process_worker(self, frame_id, frame_source, timestamp=None):
         """Unified worker that processes frames from either objects (online) or files (offline)"""
-        process_start = perf_counter()
         is_online = self.online_mode and timestamp is not None
 
         # Get frame object
@@ -363,23 +358,26 @@ class ZividPostProcessor:
             frame_obj = frame_source
             should_cleanup = True
         
-        # Process frame (same for both modes)
-        point_cloud = frame_obj.point_cloud()
-        xyz_mm = point_cloud.copy_data("xyz")
-        img = frame_obj.frame_2d().image_srgb()
+        try:
+            # Process frame (same for both modes)
+            point_cloud = frame_obj.point_cloud()
+            xyz_mm = point_cloud.copy_data("xyz")
+            img = point_cloud.copy_data("srgb")
 
-        xyz = xyz_mm / 1000.0
-        rgb = img.copy_data()[:, :, :3]
-        depth = xyz[:, :, 2]
+            xyz = xyz_mm / 1000.0
+            rgb = img[:, :, :3]
+            depth = xyz[:, :, 2]
 
-        xyz_flat = xyz.reshape(-1, 3)
-        is_valid = ~np.isnan(xyz_flat).any(axis=1)
-        valid_idxs = np.where(is_valid)[0]
-        xyz_flat_filtered = xyz_flat[valid_idxs]  # remove NaNs
+            xyz_flat = xyz.reshape(-1, 3)
+            is_valid = ~np.isnan(xyz_flat).any(axis=1)
+            valid_idxs = np.where(is_valid)[0]
+            xyz_flat_filtered = xyz_flat[valid_idxs]  # remove NaNs
 
-        rgb_flat = rgb.reshape(-1, 3)
-        rgb_flat = rgb_flat[valid_idxs]  # remove NaNs
-        pc = np.concatenate([xyz_flat_filtered, rgb_flat], axis=1).T
+            rgb_flat = rgb.reshape(-1, 3)
+            rgb_flat = rgb_flat[valid_idxs]  # remove NaNs
+            pc = np.concatenate([xyz_flat_filtered, rgb_flat], axis=1).T
+        except:
+            print("Error extracting data from frame")
 
         # Handle output based on mode
         if is_online:
@@ -447,13 +445,14 @@ class ZividPostProcessor:
         return None
 
     def save_chunk(self):
+        st = perf_counter()
         save_size = min(self.chunk_size, self.rgb_queue.qsize())
 
         # Concatenate
         rgb_arr = [self.rgb_queue.get() for _ in range(save_size)]
         depth_arr = [self.depth_queue.get() for _ in range(save_size)]
         pc_arr = [self.pc_queue.get() for _ in range(save_size)]
-        
+
         # Get timestamps (both online and offline modes now use timestamps_queue)
         timestamp_arr = []
         if not self.timestamps_queue.empty():
@@ -466,14 +465,33 @@ class ZividPostProcessor:
         if timestamp_arr:
             timestamp_arr.sort(key=lambda x: x[0])
 
-        # Make dict and save as h5
-        save_dict = {
-            "rgb": [e[1] for e in rgb_arr],
-            "depth": [e[1] for e in depth_arr],
-            "pc": [e[1] for e in pc_arr],
-        }
+        # Stack data
+        rgb_stacked = np.stack([e[1] for e in rgb_arr])
+        depth_stacked = np.stack([e[1] for e in depth_arr])
         
-        # Add timestamps if available and not None (convert ROS Time to float for HDF5 compatibility)
+        # Find max number of points across all point clouds
+        max_num_pts = max(e[1].shape[1] for e in pc_arr)
+        num_pcs = len(pc_arr)
+        
+        # Create pre-filled array with np.inf
+        pc_stacked = np.full((num_pcs, 6, max_num_pts), np.inf, dtype=np.float32)
+        
+        # Copy each point cloud into the large array
+        for i, (frame_id, pc) in enumerate(pc_arr):
+            num_pts = pc.shape[1]
+            pc_stacked[i, :, :num_pts] = pc
+
+        # Make dict and save as specified format
+        save_dict = {
+            "rgb": rgb_stacked,
+            "depth": depth_stacked,
+            "pc": pc_stacked,
+        }
+
+        for k, v in save_dict.items():
+            print(f"{k} shape: {v.shape}")
+        
+        # Add timestamps if available and not None (convert ROS Time to float for compatibility)
         if timestamp_arr:
             valid_timestamps = []
             for e in timestamp_arr:
@@ -484,11 +502,13 @@ class ZividPostProcessor:
             if any(t > 0 for t in valid_timestamps):  # Only save if we have real timestamps
                 save_dict["timestamps"] = valid_timestamps
 
-        # Save file
+        print("Took", perf_counter() - st, "seconds to add timestamp")
+
+        # Save file using the specified output format
         save_path = self.dataset_tmpl.format(self.chunk_idx)
         if not self.dry_run:
-            store_h5_dict(save_path, save_dict)
-        print(f"Saved {len(rgb_arr)} images to {save_path}")
+            store_data_dict(save_path, save_dict, self.output_format)
+        print(f"Saved {len(rgb_arr)} images to {save_path} (format: {self.output_format}) in {perf_counter() - st:.2f}s")
         self.chunk_idx += 1
         
 
@@ -564,6 +584,8 @@ def main():
     parser.add_argument("--raw", action="store_true", help="Save raw frames and process later")
     parser.add_argument("--timeout", type=float, default=None, help="Timeout in seconds for capture/processing (for testing)")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output (frame dimensions, point cloud info, FPS stats)")
+    parser.add_argument("--output-format", type=str, choices=["h5", "zarr"], default="h5",
+        help="Output format for processed data chunks (h5 or zarr)")
 
     # Parse
     args = parser.parse_args()
@@ -584,7 +606,7 @@ def main():
         nodes = []
         for settings_path in args.settings_yml:
             config_name = extract_config_name(settings_path)
-            print(f"🔧 Creating capture instance for config: {config_name}")
+            print(f"🔧 Creating capture instance for config: {config_name} (format: {args.output_format})")
             
             node = ZividLocalNode(camera,
                         args.dataset_root,
@@ -594,7 +616,8 @@ def main():
                         chunk_size=int(args.chunk_size),
                         dry_run=args.dry_run,
                         process=not args.raw,  # If raw is not set, process online
-                        verbose=args.verbose
+                        verbose=args.verbose,
+                        output_format=args.output_format
                     )
             nodes.append(node)
         
@@ -647,7 +670,7 @@ def main():
         # Create processors for each settings file
         for settings_path in args.settings_yml:
             config_name = extract_config_name(settings_path)
-            print(f"🔧 Creating processor instance for config: {config_name}")
+            print(f"🔧 Creating processor instance for config: {config_name} (format: {args.output_format})")
             
             processor = ZividPostProcessor(
                 args.dataset_root,
@@ -655,7 +678,8 @@ def main():
                 config_name,
                 chunk_size=int(args.chunk_size),
                 dry_run=args.dry_run,
-                verbose=args.verbose
+                verbose=args.verbose,
+                output_format=args.output_format
             )
             processors.append(processor)
         
