@@ -50,6 +50,7 @@ class ZividLocalNode(Node):
             process=True,  # If raw is not set, process online
             verbose=False,            # New: Enable verbose output
             output_format="h5",       # New: Output format (h5 or zarr)
+            use_config_subdir=True,   # New: Whether to use config subdirectory
         ):
         # Create unique node name with config identifier
         node_name = f'zivid_node_local_{config_name}' if config_name else 'zivid_node_local'
@@ -71,6 +72,7 @@ class ZividLocalNode(Node):
         self.online_processing = process
         self.verbose = verbose
         self.output_format = output_format
+        self.use_config_subdir = use_config_subdir
         
         # Make metadata publisher with config-specific topic
         topic_name = f"/zivid_node_local/frame_id" if config_name else "/zivid_node_local/frame_id"
@@ -92,7 +94,8 @@ class ZividLocalNode(Node):
                 dry_run=dry_run,
                 online_mode=True,
                 verbose=verbose,
-                output_format=output_format
+                output_format=output_format,
+                use_config_subdir=use_config_subdir
             )
         else:
             self.frame_queue = Queue()
@@ -106,8 +109,8 @@ class ZividLocalNode(Node):
     def _make_ds_tmpl(self, dataset_root, dataset_name, config_name):
         self.host = get_local_hostname()
 
-        # Make dataset chunk names with config-specific subdirectory
-        if config_name:
+        # Make dataset chunk names with config-specific subdirectory only if use_config_subdir is True
+        if self.use_config_subdir and config_name:
             path = os.path.abspath(os.path.join(dataset_root, dataset_name, config_name))
         else:
             path = os.path.abspath(os.path.join(dataset_root, dataset_name))
@@ -243,10 +246,12 @@ class ZividPostProcessor:
             online_mode=False,  # New: Enable online processing mode
             verbose=False,      # New: Enable verbose output
             output_format="h5", # New: Output format (h5 or zarr)
+            use_config_subdir=True,   # New: Whether to use config subdirectory
         ):
         # Make dataset collection
         self.config_name = config_name
         self.output_format = output_format
+        self.use_config_subdir = use_config_subdir
         self._make_ds_tmpl(dataset_root, dataset_name, config_name)
         
         self.chunk_idx = 0
@@ -283,8 +288,8 @@ class ZividPostProcessor:
     def _make_ds_tmpl(self, dataset_root, dataset_name, config_name):
         self.host = get_local_hostname()
 
-        # Make dataset chunk names with config-specific subdirectory
-        if config_name:
+        # Make dataset chunk names with config-specific subdirectory only if use_config_subdir is True
+        if self.use_config_subdir and config_name:
             path = os.path.abspath(os.path.join(dataset_root, dataset_name, config_name))
         else:
             path = os.path.abspath(os.path.join(dataset_root, dataset_name))
@@ -602,6 +607,9 @@ def main():
         app = zivid.Application()
         camera = app.connect_camera()
         
+        # Determine if we should use config subdirectories (only if multiple settings files)
+        use_config_subdir = len(args.settings_yml) > 1
+        
         # Create instances for each settings file
         nodes = []
         for settings_path in args.settings_yml:
@@ -617,7 +625,8 @@ def main():
                         dry_run=args.dry_run,
                         process=not args.raw,  # If raw is not set, process online
                         verbose=args.verbose,
-                        output_format=args.output_format
+                        output_format=args.output_format,
+                        use_config_subdir=use_config_subdir
                     )
             nodes.append(node)
         
@@ -667,6 +676,9 @@ def main():
     elif args.task == "process":
         processors = []
         
+        # Determine if we should use config subdirectories (only if multiple settings files)
+        use_config_subdir = len(args.settings_yml) > 1
+        
         # Create processors for each settings file
         for settings_path in args.settings_yml:
             config_name = extract_config_name(settings_path)
@@ -679,7 +691,8 @@ def main():
                 chunk_size=int(args.chunk_size),
                 dry_run=args.dry_run,
                 verbose=args.verbose,
-                output_format=args.output_format
+                output_format=args.output_format,
+                use_config_subdir=use_config_subdir
             )
             processors.append(processor)
         
