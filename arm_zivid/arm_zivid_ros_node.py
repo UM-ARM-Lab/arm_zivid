@@ -1,6 +1,8 @@
 import argparse
+from queue import Queue
 from pathlib import Path
 from typing import Optional
+import threading
 
 import numpy as np
 import zivid
@@ -25,6 +27,7 @@ class ZividNode(Node):
         use_rgb: bool = True,
         use_depth: bool = True,
         use_point_cloud: bool = True,
+        num_workers: int = 2,
     ):
         super().__init__('zivid_node')
         if settings_yml is not None:
@@ -43,25 +46,81 @@ class ZividNode(Node):
         self.rgb_pub = self.create_publisher(Image, '/zivid/rgb', 10) if use_rgb else None
         self.depth_pub = self.create_publisher(Image, '/zivid/depth', 10) if use_depth else None
 
+        self.frame_queue = Queue()
+        self.processed_queue = Queue()
+        self.num_workers = num_workers
+        self.shutdown_event = threading.Event()
+        self.workers = []
+        self.publisher_thread = None
+
+    def process_worker(self):
+        """Worker thread that processes frames from the frame queue"""
+        while not self.shutdown_event.is_set():
+            try:
+                frame = self.frame_queue.get(timeout=1.0)
+                if frame is None:  # Shutdown signal
+                    break
+                self.process_frame(frame)
+                self.frame_queue.task_done()
+            except:
+                continue  # Timeout, continue loop
+
+    def publisher_worker(self):
+        """Publisher thread that publishes processed messages and times the frequency"""
+        last_time = perf_counter()
+        publish_count = 0
+
+        while not self.shutdown_event.is_set():
+            try:
+                messages = self.processed_queue.get(timeout=1.0)
+                if messages is None:  # Shutdown signal
+                    break
+                image_msg, depth_msg, pc_msg = messages
+                self.pub2ros(image_msg, depth_msg, pc_msg)
+                self.processed_queue.task_done()
+
+                # Measure frequency
+                publish_count += 1
+                current_time = perf_counter()
+                elapsed_time = current_time - last_time
+                if elapsed_time >= 1.0:  # Log frequency every second
+                    # self.get_logger().info(f"Publishing frequency: {publish_count / elapsed_time:.2f} Hz")
+                    publish_count = 0
+                    last_time = current_time
+            except:
+                continue  # Timeout, continue loop
+
     def run(self, camera):
-        while rclpy.ok():
-            last_t = perf_counter()
-            frame = camera.capture(self.settings)
-        # last_t = perf_counter()
-        # while rclpy.ok():
-            with camera.capture(self.settings) as frame:
-                a = perf_counter()
-                point_cloud = frame.point_cloud()
-                xyz_mm = point_cloud.copy_data("xyz")
-                srgb = point_cloud.copy_data("srgb")
+        # Start worker threads
+        for i in range(self.num_workers):
+            worker = threading.Thread(target=self.process_worker, daemon=True)
+            worker.start()
+            self.workers.append(worker)
+        
+        # Start publisher thread
+        self.publisher_thread = threading.Thread(target=self.publisher_worker, daemon=True)
+        self.publisher_thread.start()
 
-                xyz = xyz_mm / 1000.0
-                rgb = srgb[:, :, :3]
-                depth = xyz[:, :, 2]
-                self.viz_pc(depth, rgb, xyz)  # 30-40ms
-                # print(f"Captured in {perf_counter() - a} seconds")
+        # Main capture loop
+        try:
+            while rclpy.ok():
+                frame = camera.capture(self.settings)
+                self.frame_queue.put(frame)
+        except KeyboardInterrupt:
+            self.get_logger().info("Shutting down...")
+        finally:
+            self.shutdown()
 
-    def viz_pc(self, depth, rgb, xyz):
+    def process_frame(self, frame):
+        a = perf_counter()
+        point_cloud = frame.point_cloud()
+        xyz_mm = point_cloud.copy_data("xyz")
+        srgb = point_cloud.copy_data("srgb")
+
+        xyz = xyz_mm / 1000.0
+        rgb = srgb[:, :, :3]
+        depth = xyz[:, :, 2]
+        
         xyz_flat = xyz.reshape(-1, 3)
         is_valid = ~np.isnan(xyz_flat).any(axis=1)
         valid_idxs = np.where(is_valid)[0]
@@ -70,22 +129,45 @@ class ZividNode(Node):
         rgb_flat = rgb.reshape(-1, 3)
         rgb_flat = rgb_flat[valid_idxs]  # remove NaNs
 
-        # publish inputs
-        if self.rgb_pub:
-            self.rgb_pub.publish(ros2_numpy.msgify(Image, rgb, encoding='rgb8'))
-        if self.depth_pub:
-            self.depth_pub.publish(ros2_numpy.msgify(Image, depth, encoding='32FC1'))
-
-        # create record array with x, y, and z fields
+        image_msg = ros2_numpy.msgify(Image, rgb, encoding='rgb8')
+        depth_msg = ros2_numpy.msgify(Image, depth, encoding='32FC1')
         if self.pc_pub:
             pc = np.concatenate([xyz_flat_filtered, rgb_flat], axis=1).T
             pc_msg = pc_np_to_pc_msg(pc, names='x,y,z,r,g,b', frame_id=CAMERA_FRAME)
+
+        self.processed_queue.put((image_msg, depth_msg, pc_msg if self.pc_pub else None))
+        # self.get_logger().info(f"Captured in {perf_counter() - a} seconds")
+
+    def pub2ros(self, image_msg, depth_msg, pc_msg):
+
+        # publish inputs
+        if self.rgb_pub:
+            self.rgb_pub.publish(image_msg)
+        if self.depth_pub:
+            self.depth_pub.publish(depth_msg)
+        if self.pc_pub:
             self.pc_pub.publish(pc_msg)
 
+    def shutdown(self):
+        """Gracefully shutdown all threads"""
+        self.shutdown_event.set()
+        
+        # Send shutdown signals to queues
+        for _ in range(self.num_workers):
+            self.frame_queue.put(None)
+        self.processed_queue.put(None)
+        
+        # Wait for workers to finish
+        for worker in self.workers:
+            worker.join(timeout=2.0)
+        
+        if self.publisher_thread:
+            self.publisher_thread.join(timeout=2.0)
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--settings_yml', type=str, default=None)
+    parser.add_argument('--num_workers', type=int, default=2, help='Number of processing worker threads')
     args = parser.parse_args()
 
     rclpy.init()
@@ -101,6 +183,7 @@ def main():
         use_rgb=True,
         use_depth=False,
         use_point_cloud=False,
+        num_workers=args.num_workers,
     )
     n.run(camera)
 

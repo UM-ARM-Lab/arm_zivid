@@ -45,7 +45,7 @@ def _enter_robot_pose(index):
 
 
 CAMERA_FRAME = 'zivid_optical_frame'
-ROBOT_FRAME = 'victor_left_tool0'
+ROBOT_FRAME = 'victor_right_tool0'
 
 
 def _main():
