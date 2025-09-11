@@ -1,6 +1,6 @@
 import re
-from glob import glob
 import os
+from glob import glob
 from time import sleep
 from tqdm import tqdm
 
@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Optional
 from time import perf_counter
 import datetime
-from queue import Queue
+from queue import Queue, Empty
 
 # Parallel processing 
 import threading
@@ -17,9 +17,13 @@ from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import zivid
+import ros2_numpy
+from arm_zivid.pc_np_to_pc_msg import pc_np_to_pc_msg
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from sensor_msgs.msg import Image, PointCloud2
 import psutil
 
 from std_msgs.msg import Header
@@ -46,6 +50,9 @@ class ZividLocalNode(Node):
             config_name,  # New: config identifier
             settings_yml: Optional[Path] = None,
             chunk_size=50,      # Save every n images
+            pub_rgb=False,
+            pub_depth=False,
+            pub_point_cloud=False,
             dry_run=False,
             process=True,  # If raw is not set, process online
             verbose=False,            # New: Enable verbose output
@@ -77,6 +84,9 @@ class ZividLocalNode(Node):
         # Make metadata publisher with config-specific topic
         topic_name = f"/zivid_node_local/frame_id" if config_name else "/zivid_node_local/frame_id"
         self.idx_pub = self.create_publisher(Header, topic_name, 10)
+        self.pub_rgb = pub_rgb
+        self.pub_depth = pub_depth
+        self.pub_point_cloud = pub_point_cloud
 
         # Make dataset collection with config-specific path
         self._make_ds_tmpl(dataset_root, dataset_name, config_name)
@@ -92,12 +102,17 @@ class ZividLocalNode(Node):
                 config_name,  # Pass config_name
                 chunk_size=chunk_size,
                 dry_run=dry_run,
+                pub_rgb=pub_rgb,
+                pub_depth=pub_depth,
+                pub_point_cloud=pub_point_cloud,
+                ros_node=self,
                 online_mode=True,
                 verbose=verbose,
                 output_format=output_format,
                 use_config_subdir=use_config_subdir
             )
         else:
+            print("ROS Publishing settings will be ignored!")
             self.frame_queue = Queue()
             # Setup procesors for raw frame saving only
             self.save_executor = ThreadPoolExecutor(max_workers=8)
@@ -142,19 +157,20 @@ class ZividLocalNode(Node):
             frame = self.camera.capture(self.settings)
             timestamp = self.get_clock().now().to_msg()
 
-            if self.online_processing:
-                self.post_processor.add_frame_online(self.frame_idx, frame, timestamp)
-            else:
-                self.frame_queue.put((self.frame_idx, frame))
-
             # Publish frame_id (sequence id = frame count)
             if not rclpy.ok():
                 break
-            self.idx_pub.publish(self._stamped_header(
+            timestep_header = self._stamped_header(
                 self.host+":"+self.dataset_path+f"/{self.frame_idx}", timestamp
-            ))
+            )
+            self.idx_pub.publish(timestep_header)
             self.frame_idx += 1
 
+            if self.online_processing:
+                self.post_processor.add_frame_online(self.frame_idx, frame, timestamp, timestep_header)
+            else:
+                self.frame_queue.put((self.frame_idx, frame))
+            
             # Debugging speed
             nframes += 1
             if perf_counter()-1.0 >= last_fps_ctr:
@@ -244,6 +260,10 @@ class ZividPostProcessor:
             chunk_size=50,      # Save every n images
             dry_run=False,
             online_mode=False,  # New: Enable online processing mode
+            pub_rgb=True,
+            pub_depth=True,
+            pub_point_cloud=True,
+            ros_node=None,
             verbose=False,      # New: Enable verbose output
             output_format="h5", # New: Output format (h5 or zarr)
             use_config_subdir=True,   # New: Whether to use config subdirectory
@@ -259,12 +279,40 @@ class ZividPostProcessor:
         self.dry_run = dry_run
         self.online_mode = online_mode
         self.verbose = verbose
+        
+        # Publishing
+        if not self.online_mode:
+            print("ROS Publishing settings will be ignored!")
+            self.pub_rgb = False
+            self.pub_depth = False
+            self.pub_pc = False
+        else:
+            self.ros_node = ros_node
+            assert isinstance(self.ros_node, Node), "ros_node must be provided in online_mode"
+            self.pub_rgb = pub_rgb
+            self.pub_depth = pub_depth
+            self.pub_pc = pub_point_cloud
+            self._setup_ros_pub(pub_rgb, pub_depth, pub_point_cloud)
+
+        # Point cloud processing parameters (same as original) - always available
+        self.crop_pc = True  # Default to cropping like in original
+        # old: self.pc_sample_box = np.array([(-0.4, -0.03), (-0.3, 0.05), (0.6, 1.1)])
+        # new:
+        self.pc_sample_box = np.array([(-0.4, -0.03), (-0.3, 0.1), (0.5, 1.1)])
+        self.hardcode_zivid_calib_matrix: np.ndarray = np.array([
+            [-0.45513538,  0.64372754, -0.6151964,   1.2741948],
+            [ 0.86081827,  0.4947717,  -0.11913376,  0.07540844],
+            [ 0.22769208, -0.5837943,  -0.77932054,  1.8988546],
+            [ 0.,          0.,          0.,          1.        ]
+        ])
+        self.pc_sample_size = 4096
+
 
         # Input queues
         self.frame_queue = Queue()  # For offline: (frame_id, file_path), online: (frame_id, frame_obj, timestamp)
         
         # Processing result queues (for ordered insertion)
-        self.processed_results = {}  # frame_id -> (rgb, depth, pc, timestamp)
+        self.processed_results = {}  # frame_id -> (rgb, depth, pc, timestamp, rgb_msg, depth_msg, pc_msg, timestep_header)
         self.next_expected_frame = 0  # For maintaining order
         self.results_lock = threading.Lock()
         
@@ -284,6 +332,36 @@ class ZividPostProcessor:
         self.chunking_thread = threading.Thread(target=self.start_chunking)  # New: Handles chunk saving
         self.save_executor = ThreadPoolExecutor(max_workers=8)
         self.shutdown_event = threading.Event()
+
+    def _setup_ros_pub(self, use_rgb, use_depth, use_point_cloud):
+        assert isinstance(self.ros_node, Node), "ros_node must be provided in online_mode"
+
+        qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+        )
+
+        # RGB
+        self.rgb_pub = self.ros_node.create_publisher(
+            Image,
+            '/zivid/rgb',
+            qos
+        ) if self.pub_rgb else None
+
+        # Depth
+        self.depth_pub = self.ros_node.create_publisher(
+            Image,
+            '/zivid/depth',
+            10
+        ) if self.pub_depth else None
+
+        # PC
+        self.pc_pub = self.ros_node.create_publisher(
+            PointCloud2,
+            '/zivid/pc',
+            qos
+        ) if self.pub_pc else None
 
     def _make_ds_tmpl(self, dataset_root, dataset_name, config_name):
         self.host = get_local_hostname()
@@ -335,24 +413,25 @@ class ZividPostProcessor:
 
     def start_processing(self):
         while not self.shutdown_event.is_set():
-            if not self.frame_queue.empty():
-                frame_data = self.frame_queue.get()
-                print(f"After get, {self.frame_queue.qsize()} frames in queue")
-                if self.online_mode:
-                    # Online mode: (frame_id, frame_obj, timestamp)
-                    frame_id, frame_obj, timestamp = frame_data
-                    self.save_executor.submit(self.post_process_worker, frame_id, frame_obj, timestamp)
+            try:
+                queue_item = self.frame_queue.get(timeout=1.0)
+                if len(queue_item) == 4:
+                    # Online mode: (frame_id, frame_obj, timestamp, timestep_header)
+                    frame_id, frame_obj, timestamp, timestep_header = queue_item
                 else:
-                    # Offline mode: (frame_id, file_path) - convert to online format
-                    frame_id, frame_file = frame_data
-                    self.save_executor.submit(self.post_process_worker, frame_id, frame_file, None)
-            else:
-                sleep(0.01)
+                    # Offline mode: (frame_id, file_path, None) or legacy format
+                    frame_id, frame_obj, timestamp = queue_item[:3]
+                    timestep_header = None
+                # print(f"After get, {self.frame_queue.qsize()} frames in queue")
+                self.save_executor.submit(self.post_process_worker, frame_id, frame_obj, timestamp, timestep_header)
+            except Empty:
+                continue
+            except Exception as e:
+                print(f"Error in processing thread: {e}")
+                continue
 
-    def post_process_worker(self, frame_id, frame_source, timestamp=None):
+    def post_process_worker(self, frame_id, frame_source, timestamp=None, timestep_header=None):
         """Unified worker that processes frames from either objects (online) or files (offline)"""
-        is_online = self.online_mode and timestamp is not None
-
         # Get frame object
         if isinstance(frame_source, str):
             # Offline mode: load from file
@@ -364,15 +443,15 @@ class ZividPostProcessor:
             should_cleanup = True
         
         try:
-            # Process frame (same for both modes)
+            # Process frame (same as original arm_zivid_ros_node.py)
             point_cloud = frame_obj.point_cloud()
             xyz_mm = point_cloud.copy_data("xyz")
-            img = point_cloud.copy_data("srgb")
+            srgb = point_cloud.copy_data("srgb")
 
             xyz = xyz_mm / 1000.0
-            rgb = img[:, :, :3]
+            rgb = srgb[:, :, :3]
             depth = xyz[:, :, 2]
-
+            
             xyz_flat = xyz.reshape(-1, 3)
             is_valid = ~np.isnan(xyz_flat).any(axis=1)
             valid_idxs = np.where(is_valid)[0]
@@ -380,45 +459,124 @@ class ZividPostProcessor:
 
             rgb_flat = rgb.reshape(-1, 3)
             rgb_flat = rgb_flat[valid_idxs]  # remove NaNs
-            pc = np.concatenate([xyz_flat_filtered, rgb_flat], axis=1).T
-        except:
-            print("Error extracting data from frame")
 
-        # Handle output based on mode
-        if is_online:
-            # Online mode: use ordered processing with timestamps
+            # Create basic point cloud data for storage (no cropping/transformation)
+            pc_basic = np.concatenate([xyz_flat_filtered, rgb_flat], axis=1).T
+
+            # Create ROS messages if publishing is enabled (process in parallel)
+            rgb_msg = None
+            depth_msg = None
+            pc_msg = None
+            
+            # Use timestep_header.frame_id if available, otherwise use CAMERA_FRAME
+            frame_id_to_use = timestep_header.frame_id if timestep_header is not None else CAMERA_FRAME
+            
+            if self.pub_rgb:
+                rgb_msg = ros2_numpy.msgify(Image, rgb, encoding='rgb8')
+                if timestamp is not None:
+                    rgb_msg.header.stamp = timestamp
+                rgb_msg.header.frame_id = frame_id_to_use
+                
+            if self.pub_depth:
+                depth_msg = ros2_numpy.msgify(Image, depth, encoding='32FC1')
+                if timestamp is not None:
+                    depth_msg.header.stamp = timestamp
+                depth_msg.header.frame_id = frame_id_to_use
+                
+            if self.pub_pc:
+                # Process point cloud for ROS publishing (with cropping, transformation, sampling)
+                pc_ros = self._process_pc_for_ros(pc_basic)
+                pc_msg = pc_np_to_pc_msg(pc_ros, names='x,y,z,r,g,b', frame_id=frame_id_to_use)
+                if timestamp is not None:
+                    pc_msg.header.stamp = timestamp
+
+            # Handle output based on mode
             with self.results_lock:
-                self.processed_results[frame_id] = (rgb, depth, pc, timestamp)
-        else:
-            # Offline mode: use ordered processing but with None timestamp for consistency
-            with self.results_lock:
-                self.processed_results[frame_id] = (rgb, depth, pc, None)
+                self.processed_results[frame_id] = (rgb, depth, pc_basic, timestamp, rgb_msg, depth_msg, pc_msg, timestep_header)
+        except Exception as e:
+            print(f"Error extracting data from frame {frame_id}: {e}")
 
         # Clean up frame object
         if should_cleanup:
             del frame_obj
 
+    def _process_pc_for_ros(self, pc_basic):
+        """Process point cloud specifically for ROS publishing with cropping, transformation, and sampling"""
+        pc = pc_basic.copy()  # Don't modify the original
+        
+        # Apply cropping and transformation (same as original arm_zivid_ros_node.py)
+        if self.crop_pc:
+            x_min, x_max = self.pc_sample_box[0]
+            y_min, y_max = self.pc_sample_box[1]
+            z_min, z_max = self.pc_sample_box[2]
+
+            mask = (
+                (pc[0] >= x_min) & (pc[0] <= x_max) &
+                (pc[1] >= y_min) & (pc[1] <= y_max) &
+                (pc[2] >= z_min) & (pc[2] <= z_max)
+            )
+            pc_boxed = pc[:, mask]
+            homo_matrix = self.hardcode_zivid_calib_matrix
+
+            # Transform points
+            homo_ones = np.ones((1,)+pc_boxed.shape[1:], dtype=pc_boxed.dtype)
+            pc_xyz_homo = np.vstack([pc_boxed[:3], homo_ones])      # 4xN
+            pc_xyz_transformed = homo_matrix @ pc_xyz_homo       # 4xN
+            pc_xyz = pc_xyz_transformed[:3]     # 3xN
+            pc_boxed[:3] = pc_xyz
+            
+            # Sample points
+            if pc_boxed.shape[1] > 0:  # Make sure we have points after cropping
+                sampled_idx = np.random.choice(pc_boxed.shape[1], 
+                                             min(self.pc_sample_size, pc_boxed.shape[1]), 
+                                             replace=True)
+                pc = pc_boxed[:, sampled_idx]
+            else:
+                # If no points after cropping, return empty point cloud with correct shape
+                pc = np.empty((6, 0), dtype=pc.dtype)
+        
+        return pc
+
     def start_ordering(self):
         """Thread to maintain ordered processing results"""
         while not self.shutdown_event.is_set():
             with self.results_lock:
-                if self.next_expected_frame in self.processed_results:
-                    rgb, depth, pc, timestamp = self.processed_results.pop(self.next_expected_frame)
-                    
-                    # Add to ordered queues
-                    self.rgb_queue.put((self.next_expected_frame, rgb))
-                    self.depth_queue.put((self.next_expected_frame, depth))
-                    self.pc_queue.put((self.next_expected_frame, pc))
-                    self.timestamps_queue.put((self.next_expected_frame, timestamp))
-                    
-                    # Add to in-memory history
-                    with self.history_lock:
-                        self.frame_history.append((self.next_expected_frame, rgb, depth, pc, timestamp))
-                        # Keep history size manageable (last 100 frames)
-                        if len(self.frame_history) > 100:
-                            self.frame_history.pop(0)
-                    
-                    self.next_expected_frame += 1
+                if self.next_expected_frame not in self.processed_results:
+                    sleep(0.001)
+                    continue
+                result = self.processed_results.pop(self.next_expected_frame)
+                if len(result) == 8:
+                    # New format with timestep_header
+                    rgb, depth, pc, timestamp, rgb_msg, depth_msg, pc_msg, timestep_header = result
+                else:
+                    # Legacy format without timestep_header
+                    rgb, depth, pc, timestamp, rgb_msg, depth_msg, pc_msg = result
+                    timestep_header = None
+            
+            # Add to ordered queues (save basic point cloud for storage)
+            self.rgb_queue.put((self.next_expected_frame, rgb))
+            self.depth_queue.put((self.next_expected_frame, depth))
+            self.pc_queue.put((self.next_expected_frame, pc))
+            self.timestamps_queue.put((self.next_expected_frame, timestamp))
+
+            # ROS publish if enabled - just publish the pre-created messages
+            if self.pub_rgb and rgb_msg is not None:
+                self.rgb_pub.publish(rgb_msg)
+                
+            if self.pub_depth and depth_msg is not None:
+                self.depth_pub.publish(depth_msg)
+                
+            if self.pub_pc and pc_msg is not None:
+                self.pc_pub.publish(pc_msg)
+
+            # Add to in-memory history
+            with self.history_lock:
+                self.frame_history.append((self.next_expected_frame, rgb, depth, pc, timestamp))
+                # Keep history size manageable (last 100 frames)
+                if len(self.frame_history) > 100:
+                    self.frame_history.pop(0)
+            
+            self.next_expected_frame += 1
             sleep(0.001)  # Short sleep to avoid busy waiting
 
     def start_chunking(self):
@@ -428,13 +586,13 @@ class ZividPostProcessor:
                 self.save_chunk()
             sleep(0.1)  # Check every 100ms
 
-    def add_frame_online(self, frame_id, frame_obj, timestamp):
+    def add_frame_online(self, frame_id, frame_obj, timestamp, timestep_header=None):
         """Add frame for online processing"""
-        self.frame_queue.put((frame_id, frame_obj, timestamp))
+        self.frame_queue.put((frame_id, frame_obj, timestamp, timestep_header))
 
     def add_frame_offline(self, frame_id, frame_file):
         """Add frame for offline processing"""
-        self.frame_queue.put((frame_id, frame_file))
+        self.frame_queue.put((frame_id, frame_file, None))
 
     def get_latest_frames(self, n=1):
         """Get the latest n processed frames from history"""
@@ -492,9 +650,6 @@ class ZividPostProcessor:
             "depth": depth_stacked,
             "pc": pc_stacked,
         }
-
-        for k, v in save_dict.items():
-            print(f"{k} shape: {v.shape}")
         
         # Add timestamps if available and not None (convert ROS Time to float for compatibility)
         if timestamp_arr:
@@ -507,13 +662,19 @@ class ZividPostProcessor:
             if any(t > 0 for t in valid_timestamps):  # Only save if we have real timestamps
                 save_dict["timestamps"] = valid_timestamps
 
-        print("Took", perf_counter() - st, "seconds to add timestamp")
+        if self.pub_rgb or self.pub_depth or self.pub_pc:
+            if self.ros_node is not None:
+                self.ros_node.get_logger().info(f"Saving chunk {self.chunk_idx} with {save_size} frames to {self.dataset_tmpl.format(self.chunk_idx)}")
+            else:
+                print(f"Saving chunk {self.chunk_idx} with {save_size} frames to {self.dataset_tmpl.format(self.chunk_idx)}")
+        else:
+            print("Took", perf_counter() - st, "seconds to add timestamp")
 
         # Save file using the specified output format
         save_path = self.dataset_tmpl.format(self.chunk_idx)
         if not self.dry_run:
             store_data_dict(save_path, save_dict, self.output_format)
-        print(f"Saved {len(rgb_arr)} images to {save_path} (format: {self.output_format}) in {perf_counter() - st:.2f}s")
+        # print(f"Saved {len(rgb_arr)} images to {save_path} (format: {self.output_format}) in {perf_counter() - st:.2f}s")
         self.chunk_idx += 1
         
 
@@ -589,6 +750,9 @@ def main():
     parser.add_argument("--raw", action="store_true", help="Save raw frames and process later")
     parser.add_argument("--timeout", type=float, default=None, help="Timeout in seconds for capture/processing (for testing)")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output (frame dimensions, point cloud info, FPS stats)")
+    parser.add_argument("--pub_rgb", action="store_true", help="Enable RGB image publishing (only in online mode)")
+    parser.add_argument("--pub_depth", action="store_true", help="Enable depth image publishing (only in online mode)")
+    parser.add_argument("--pub_pc", action="store_true", help="Enable point cloud publishing (only in online mode)")
     parser.add_argument("--output-format", type=str, choices=["h5", "zarr"], default="h5",
         help="Output format for processed data chunks (h5 or zarr)")
 
@@ -617,17 +781,20 @@ def main():
             print(f"🔧 Creating capture instance for config: {config_name} (format: {args.output_format})")
             
             node = ZividLocalNode(camera,
-                        args.dataset_root,
-                        args.dataset_name,
-                        config_name,
-                        settings_yml=settings_path,
-                        chunk_size=int(args.chunk_size),
-                        dry_run=args.dry_run,
-                        process=not args.raw,  # If raw is not set, process online
-                        verbose=args.verbose,
-                        output_format=args.output_format,
-                        use_config_subdir=use_config_subdir
-                    )
+                args.dataset_root,
+                args.dataset_name,
+                config_name,
+                settings_yml=settings_path,
+                chunk_size=int(args.chunk_size),
+                dry_run=args.dry_run,
+                pub_rgb=args.pub_rgb,
+                pub_depth=args.pub_depth,
+                pub_point_cloud=args.pub_pc,
+                process=not args.raw,  # If raw is not set, process online
+                verbose=args.verbose,
+                output_format=args.output_format,
+                use_config_subdir=use_config_subdir
+            )
             nodes.append(node)
         
         # Start timeout thread if specified

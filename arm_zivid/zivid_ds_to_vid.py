@@ -86,7 +86,7 @@ def normalize_depth(depth_data, min_depth=None, max_depth=None):
 def create_video_writer(output_path, fps, frame_size):
     """Create OpenCV video writer"""
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    return cv2.VideoWriter(output_path, fourcc, fps, frame_size)
+    return cv2.VideoWriter(str(output_path), fourcc, fps, frame_size)
 
 def process_rgb_frames(frames_data, output_path, fps):
     """Process RGB frames and create video"""

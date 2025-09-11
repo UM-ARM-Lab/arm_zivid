@@ -5,7 +5,7 @@ from ros2_numpy.point_cloud2 import merge_rgb_fields
 from sensor_msgs.msg import PointCloud2
 
 
-def pc_np_to_pc_msg(pc, names, frame_id):
+def pc_np_to_pc_msg(pc, names, frame_id, logger=None):
     """
 
     Args:
